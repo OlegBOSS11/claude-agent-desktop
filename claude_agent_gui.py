@@ -27,7 +27,7 @@ except ImportError:
 # ============ CONSTANTS ============
 
 APP_NAME = "Claude Agent"
-APP_VERSION = "8.1"
+APP_VERSION = "9.0"
 GITHUB_REPO = "OlegBOSS11/claude-agent-desktop"
 GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 WINDOW_SIZE = "1040x760"
