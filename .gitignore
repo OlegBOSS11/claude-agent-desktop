@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+dist/
+build/
+*.spec
+*.pyc
+outputs/
+work/
+chat_history/
+settings.json
