@@ -30,6 +30,9 @@ duckduckgo-search>=6.0.0
 # Утилиты
 python-dotenv>=1.0.0
 
+# Безопасное хранение API-ключей (опционально, но рекомендуется)
+keyring>=24.0.0
+
 # Сборка (опционально)
 # pyinstaller>=6.0       # для Windows .exe
 # py2app>=0.28           # для macOS .app
