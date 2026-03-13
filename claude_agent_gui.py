@@ -15,6 +15,15 @@ from typing import Optional, Dict, Any, List
 from tkinter import filedialog
 import tkinter as tk
 
+# Keyring — безопасное хранение API-ключей (опционально)
+try:
+    import keyring
+    _KEYRING_SERVICE = "claude-agent-desktop"
+    _KEYRING_USER = "api_key"
+    KEYRING_AVAILABLE = True
+except ImportError:
+    KEYRING_AVAILABLE = False
+
 import customtkinter as ctk
 
 # Drag & Drop (опционально)
@@ -179,14 +188,35 @@ def load_settings():
         if SETTINGS_FILE.exists():
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 d.update(json.load(f))
-    except Exception: pass
+    except Exception:
+        pass
+    # Загружаем API-ключ из системного хранилища (keyring)
+    if KEYRING_AVAILABLE:
+        try:
+            stored_key = keyring.get_password(_KEYRING_SERVICE, _KEYRING_USER)
+            if stored_key:
+                d["api_key"] = stored_key
+        except Exception:
+            pass
     return d
 
 def save_settings(s):
+    # Сохраняем API-ключ в системное хранилище, из файла убираем
+    s_to_file = s.copy()
+    if KEYRING_AVAILABLE:
+        try:
+            keyring.set_password(_KEYRING_SERVICE, _KEYRING_USER, s.get("api_key", ""))
+            s_to_file["api_key"] = ""  # не хранить в plaintext
+        except Exception:
+            pass  # если keyring недоступен — fallback в файл
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(s, f, ensure_ascii=False, indent=2)
-    except Exception: pass
+            json.dump(s_to_file, f, ensure_ascii=False, indent=2)
+        # Ограничиваем права файла только владельцем (Unix)
+        if platform.system() != "Windows":
+            os.chmod(SETTINGS_FILE, 0o600)
+    except Exception:
+        pass
 
 def all_models(s): return list(dict.fromkeys(PRESET_MODELS + s.get("custom_models", [])))
 def all_urls(s): return list(dict.fromkeys(PRESET_URLS + s.get("custom_urls", [])))
@@ -475,8 +505,17 @@ class SettingsWindow(ctk.CTkToplevel):
         for n, b in self._color_btns.items(): b.configure(border_width=3 if n == name else 0)
     def _save(self):
         key = self.api_entry.get().strip()
-        if not key: self.api_entry.configure(border_color=C["err"]); return
+        if not key:
+            self.api_entry.configure(border_color=C["err"])
+            return
         model, url = self.model_var.get().strip(), self.url_var.get().strip()
+        # Валидация URL
+        if url and not url.startswith(("http://", "https://")):
+            url = "https://" + url
+            self.url_var.set(url)
+        if not url:
+            url = PRESET_URLS[0]
+            self.url_var.set(url)
         cm = list(self.settings.get("custom_models", []))
         if model and model not in PRESET_MODELS and model not in cm: cm.append(model)
         cu = list(self.settings.get("custom_urls", []))
@@ -1148,7 +1187,7 @@ class ChatApp(_DnDBase):
             if platform.system() == "Darwin":
                 itb.bind("<Meta-c>", _copy_sel); itb.bind("<Meta-a>", _sel_all)
             itb.bind("<Button-3>", _ctx_menu)
-        if platform.system() == "Darwin": itb.bind("<Button-2>", _ctx_menu)
+            if platform.system() == "Darwin": itb.bind("<Button-2>", _ctx_menu)
 
         # --- Кнопки действий под пузырём (как DeepSeek) ---
         actions = ctk.CTkFrame(outer, fg_color="transparent")
@@ -1376,6 +1415,9 @@ class ChatApp(_DnDBase):
         if not hasattr(self, '_stream_tb') or not self._stream_tb.winfo_exists():
             return
         self._stream_text += chunk
+        # Защита от утечки памяти при очень длинных ответах
+        if len(self._stream_text) > 200_000:
+            self._stream_text = self._stream_text[-150_000:]
 
         # Убрать завершённые <think>...</think>
         display = re.sub(r'<think>.*?</think>', '', self._stream_text, flags=re.DOTALL).strip()
@@ -1397,6 +1439,10 @@ class ChatApp(_DnDBase):
         self._scroll_down()
 
     def _process_stream(self, text):
+        # Автоматический таймаут 5 минут — предотвращает вечное зависание UI
+        _timeout_timer = threading.Timer(300, self._stop_event.set)
+        _timeout_timer.daemon = True
+        _timeout_timer.start()
         try:
             from claude_agent_v3 import run_agent_stream
             r = run_agent_stream(
@@ -1408,6 +1454,8 @@ class ChatApp(_DnDBase):
             self.after(0, self._on_stream_done, r.get("output", "Нет ответа"))
         except Exception as e:
             self.after(0, self._on_err, str(e))
+        finally:
+            _timeout_timer.cancel()
 
     def _on_stream_done(self, answer):
         """Стриминг завершён — заменить стриминг-пузырь на нормальный."""

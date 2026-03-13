@@ -27,9 +27,12 @@ import subprocess
 import json
 import logging
 import uuid
+import atexit
+import ipaddress
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -109,22 +112,53 @@ WORK_DIR.mkdir(exist_ok=True)
 
 # --- Безопасность: ограничения для bash ---
 BASH_BLOCKED_PATTERNS = [
-    r"\brm\s+-rf\s+/",       # rm -rf /
-    r"\bmkfs\b",             # форматирование дисков
-    r"\bdd\s+if=",           # запись в устройства
-    r":(){.*};:",            # fork bomb
-    r"\bcurl\b.*\|\s*bash",  # curl | bash
-    r"\bwget\b.*\|\s*bash",  # wget | bash
-    r"\bsudo\b",             # sudo
-    r"\bchmod\s+777\s+/",    # chmod 777 /
-    r"\b>\s*/etc/",          # перезапись системных файлов
-    r"\b>\s*/dev/",          # запись в устройства
+    r"\brm\s+-rf\s+/",           # rm -rf /
+    r"\brm\s+.*\.\.",            # rm с path traversal (..)
+    r"\bmkfs\b",                 # форматирование дисков
+    r"\bdd\s+if=",               # запись в устройства
+    r":(){.*};:",                # fork bomb
+    r"\bcurl\b.*\|\s*bash",      # curl | bash
+    r"\bwget\b.*\|\s*bash",      # wget | bash
+    r"\bsudo\b",                 # sudo
+    r"\bchmod\s+777\s+/",        # chmod 777 /
+    r">\s*/etc/",                # перезапись системных файлов
+    r">\s*/dev/",                # запись в устройства
+    r">\s*/sys/",                # запись в /sys
+    r">\s*/proc/",               # запись в /proc
+    r"\bshutdown\b",             # выключение системы
+    r"\breboot\b",               # перезагрузка
+    r"\bhalt\b",                 # остановка
+    r"\bpoweroff\b",             # выключение
+    r"\bkill\s+-9\s+1\b",        # kill PID 1
+    r"\biptables\b",             # манипуляция фаерволом
+    r"\bpasswd\b",               # смена пароля
+    r"\buseradd\b|\buserdel\b",  # управление пользователями
+    r"\bchown\b.*\/",            # смена владельца системных путей
+    r"\bsystemctl\b",            # управление сервисами
+    r"\bservice\b.*start|stop",  # управление сервисами
 ]
 
 # --- Безопасность: ограничения для python ---
 PYTHON_BLOCKED_IMPORTS = [
     "ctypes", "socket", "http.server", "smtplib",
-    "ftplib", "telnetlib", "xmlrpc",
+    "ftplib", "telnetlib", "xmlrpc", "subprocess",
+]
+
+# Опасные встроенные функции и паттерны в python-коде
+PYTHON_BLOCKED_CODE_PATTERNS = [
+    r'\bexec\s*\(',          # exec(...)
+    r'\beval\s*\(',          # eval(...)
+    r'\bcompile\s*\(',       # compile(...)
+    r'\bos\.system\s*\(',    # os.system(...)
+    r'\bos\.popen\s*\(',     # os.popen(...)
+    r'\bos\.exec',           # os.execv, os.execl, etc.
+    r'\bos\.spawn',          # os.spawnl, etc.
+    r'\bos\.remove\s*\(\s*["\'/]',   # os.remove('/...')
+    r'\bos\.unlink\s*\(\s*["\'/]',   # os.unlink('/...')
+    r'__import__',           # __import__()
+    r'importlib',            # importlib bypass
+    r'\bopen\s*\(.*["\']w',  # open(..., 'w') - запись в файлы
+    r'\bopen\s*\(.*["\']a',  # open(..., 'a') - append в файлы
 ]
 
 SYSTEM_PROMPT = f"""Ты полезный AI-ассистент с доступом к инструментам.
@@ -234,6 +268,40 @@ def _resolve_file(filename: str, must_exist: bool = True) -> Optional[Path]:
 
 # ============ HELPERS: SECURITY ============
 
+def _is_safe_url(url: str) -> Optional[str]:
+    """Проверяет URL на SSRF-уязвимости. Возвращает сообщение об ошибке или None."""
+    try:
+        parsed = urlparse(url)
+
+        # Разрешаем только http и https
+        if parsed.scheme not in ("http", "https"):
+            return f"⛔ Запрещённая схема URL: {parsed.scheme}. Разрешены: http, https"
+
+        hostname = parsed.hostname
+        if not hostname:
+            return "⛔ Некорректный URL: отсутствует хост"
+
+        # Блокируем loopback/localhost по имени
+        blocked_hostnames = {
+            "localhost", "127.0.0.1", "0.0.0.0", "::1",
+            "[::1]", "[::]", "ip6-localhost", "ip6-loopback",
+        }
+        if hostname.lower() in blocked_hostnames:
+            return f"⛔ Доступ к локальным адресам запрещён: {hostname}"
+
+        # Проверяем IP-адреса на принадлежность к частным диапазонам
+        try:
+            ip = ipaddress.ip_address(hostname)
+            if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_multicast:
+                return f"⛔ Доступ к внутренним/частным IP запрещён: {hostname}"
+        except ValueError:
+            pass  # Не IP-адрес — продолжаем
+
+        return None
+    except Exception:
+        return "⛔ Некорректный URL"
+
+
 def _check_bash_safety(command: str) -> Optional[str]:
     """Проверяет команду bash на опасные паттерны. Возвращает ошибку или None."""
     for pattern in BASH_BLOCKED_PATTERNS:
@@ -243,16 +311,14 @@ def _check_bash_safety(command: str) -> Optional[str]:
 
 
 def _check_python_safety(code: str) -> Optional[str]:
-    """Проверяет Python-код на запрещённые импорты. Возвращает ошибку или None."""
-    # Блокируем __import__() для обхода проверок
-    if "__import__" in code:
-        return "⛔ Запрещено: __import__()"
-    if "importlib" in code:
-        return "⛔ Запрещено: importlib"
+    """Проверяет Python-код на запрещённые импорты и опасные паттерны."""
     for mod in PYTHON_BLOCKED_IMPORTS:
         if re.search(rf"\bimport\s+{re.escape(mod)}\b", code) or \
            re.search(rf"\bfrom\s+{re.escape(mod)}\b", code):
             return f"⛔ Запрещённый модуль: {mod}"
+    for pattern in PYTHON_BLOCKED_CODE_PATTERNS:
+        if re.search(pattern, code):
+            return f"⛔ Запрещённая конструкция: {pattern}"
     return None
 
 
@@ -1599,6 +1665,11 @@ def fetch_url(url: str) -> str:
         if not url.startswith("http"):
             url = "https://" + url
 
+        # Проверка SSRF
+        ssrf_error = _is_safe_url(url)
+        if ssrf_error:
+            return ssrf_error
+
         req = urllib.request.Request(url, headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         })
@@ -1667,6 +1738,10 @@ def _close_browser():
         except Exception:
             pass
         _browser_driver = None
+
+
+# Регистрируем закрытие браузера при выходе из приложения
+atexit.register(_close_browser)
 
 
 @tool
