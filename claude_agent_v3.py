@@ -196,13 +196,21 @@ EXCEL:
   используй excel_create_pivot
 - Многоуровневые заголовки объединяй через " | "
 
+ДЛИННЫЕ ДОКУМЕНТЫ (Map-Reduce):
+- document_analyze_full: ВСЕГДА используй для длинных документов (PDF, DOCX, TXT, Excel)
+  если нужен полный анализ без обрезки — инструмент сам разобьёт на части и синтезирует ответ
+- Признаки что нужен document_analyze_full: "проанализируй весь", "не обрезай", "весь документ",
+  "полный анализ", документ > 10 страниц, или если pdf_read вернул "(обрезано)"
+
 PDF:
-- Для чтения текста из PDF: pdf_read
+- Для быстрого чтения (первые страницы): pdf_read
+- Для ПОЛНОГО анализа всего PDF: document_analyze_full
 - Для информации о PDF: pdf_info
 - Для извлечения страниц: pdf_extract_pages
 
 WORD (DOCX):
-- Для чтения .docx: docx_read
+- Для быстрого чтения: docx_read
+- Для ПОЛНОГО анализа длинного DOCX: document_analyze_full
 - Для создания .docx: docx_create (поддержка заголовков # ## ###)
 
 ИЗОБРАЖЕНИЯ:
@@ -300,6 +308,98 @@ def _is_safe_url(url: str) -> Optional[str]:
         return None
     except Exception:
         return "⛔ Некорректный URL"
+
+
+# Глобальный экземпляр LLM — используется инструментом document_analyze_full
+_llm_instance = None
+
+
+# ============ HELPERS: DOCUMENT CHUNKING ============
+
+def _extract_full_text(filename: str) -> str:
+    """Извлечь весь текст из файла без ограничений по длине.
+    Поддерживает PDF, DOCX, TXT, Excel/CSV и другие текстовые форматы.
+    """
+    filepath = _resolve_file(filename)
+    if not filepath:
+        return f"⚠️ Файл не найден: {filename}"
+
+    ext = filepath.suffix.lower()
+    try:
+        if ext == ".pdf":
+            if not PDF_AVAILABLE:
+                return "⚠️ PyMuPDF не установлен (pip install pymupdf)"
+            doc = pymupdf.open(str(filepath))
+            parts = []
+            for i, page in enumerate(doc):
+                t = page.get_text().strip()
+                if t:
+                    parts.append(f"[Стр. {i + 1}]\n{t}")
+            doc.close()
+            if not parts:
+                return "⚠️ PDF не содержит извлекаемого текста (возможно, скан)"
+            return "\n\n".join(parts)
+
+        elif ext == ".docx":
+            if not DOCX_AVAILABLE:
+                return "⚠️ python-docx не установлен (pip install python-docx)"
+            doc = DocxDocument(str(filepath))
+            lines = []
+            for para in doc.paragraphs:
+                if para.text.strip():
+                    lines.append(para.text)
+            return "\n".join(lines)
+
+        elif ext in (".xlsx", ".xls"):
+            if not EXCEL_AVAILABLE:
+                return "⚠️ pandas/openpyxl не установлены"
+            df = pd.read_excel(filepath, dtype=str)
+            return df.fillna("").to_string(index=False)
+
+        elif ext == ".csv":
+            if not EXCEL_AVAILABLE:
+                return "⚠️ pandas не установлен"
+            # Авто-определение кодировки и разделителя
+            for enc in ("utf-8", "cp1251", "latin-1"):
+                try:
+                    df = pd.read_csv(filepath, dtype=str, encoding=enc)
+                    return df.fillna("").to_string(index=False)
+                except UnicodeDecodeError:
+                    continue
+            return "⚠️ Не удалось определить кодировку CSV"
+
+        else:
+            # Универсальный текстовый fallback
+            return filepath.read_text(encoding="utf-8", errors="replace")
+
+    except Exception as e:
+        return f"⚠️ Ошибка извлечения текста: {e}"
+
+
+def _chunk_text(text: str, chunk_size: int = 3000, overlap: int = 300) -> list:
+    """Разбить текст на перекрывающиеся чанки по границам абзацев/предложений."""
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+
+        # Разрезаем по ближайшей «мягкой» границе, если не конец текста
+        if end < len(text):
+            for sep in ("\n\n", "\n", ". ", "! ", "? ", " "):
+                idx = text.rfind(sep, start + chunk_size // 2, end)
+                if idx != -1:
+                    end = idx + len(sep)
+                    break
+
+        chunks.append(text[start:min(end, len(text))])
+        start = end - overlap
+        if start >= len(text):
+            break
+
+    return chunks
 
 
 def _check_bash_safety(command: str) -> Optional[str]:
@@ -1907,6 +2007,103 @@ def browser_screenshot(filename: str = "screenshot.png") -> str:
 
 # ============ AGENT ============
 
+@tool
+def document_analyze_full(filename: str, task: str, chunk_size: int = 3000) -> str:
+    """Полный анализ длинного документа методом Map-Reduce — без обрезки.
+
+    Разбивает документ на перекрывающиеся части, анализирует каждую,
+    затем синтезирует единый ответ. Используй для PDF, DOCX, TXT, Excel, CSV
+    когда документ длинный и обычный pdf_read/docx_read его обрезает.
+
+    Args:
+        filename: Имя файла (PDF, DOCX, TXT, XLSX, CSV)
+        task: Задача или вопрос — что именно нужно извлечь / проанализировать
+        chunk_size: Размер одного чанка в символах (по умолчанию 3000 ≈ ~700 токенов)
+    """
+    global _llm_instance
+    if _llm_instance is None:
+        return "⚠️ LLM не инициализирован. Сначала инициализируй агента."
+
+    # 1. Извлечь весь текст без ограничений
+    text = _extract_full_text(filename)
+    if text.startswith("⚠️"):
+        return text
+
+    total_chars = len(text)
+    fname = Path(filename).name
+
+    # Если документ короткий — просто возвращаем текст для прямого анализа
+    if total_chars <= chunk_size:
+        return (
+            f"📄 {fname} ({total_chars:,} символов) — достаточно короткий для прямого анализа.\n\n"
+            f"{text}"
+        )
+
+    # 2. Разбить на чанки с перекрытием
+    overlap = max(200, chunk_size // 10)
+    chunks = _chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+    n = len(chunks)
+
+    # Ограничение: не более 30 чанков во избежание зависания
+    if n > 30:
+        bigger = chunk_size * n // 30
+        chunks = _chunk_text(text, chunk_size=bigger, overlap=bigger // 10)
+        n = len(chunks)
+
+    logger.info(f"document_analyze_full: {fname}, {total_chars:,} символов → {n} чанков")
+
+    # 3. MAP — анализируем каждый чанк независимо
+    partial_results = []
+    for i, chunk in enumerate(chunks):
+        map_prompt = (
+            f"Ты анализируешь ЧАСТЬ {i + 1} из {n} документа «{fname}».\n"
+            f"Задача: {task}\n\n"
+            f"Текст части:\n{chunk}\n\n"
+            f"Выдели только то, что относится к задаче из ЭТОЙ части. "
+            f"Если в части нет релевантной информации — напиши «нет данных»."
+        )
+        try:
+            resp = _llm_instance.invoke(map_prompt)
+            result_text = resp.content if hasattr(resp, "content") else str(resp)
+            partial_results.append(f"[Часть {i + 1}/{n}]\n{result_text.strip()}")
+        except Exception as e:
+            partial_results.append(f"[Часть {i + 1}/{n}] ⚠️ Ошибка: {e}")
+
+    # Убираем пустые/«нет данных» части из синтеза чтобы не засорять контекст
+    relevant = [r for r in partial_results if "нет данных" not in r.lower() or "[Часть" not in r]
+    if not relevant:
+        relevant = partial_results  # все нерелевантны — берём всё равно
+
+    # 4. REDUCE — синтезируем финальный ответ
+    reduce_prompt = (
+        f"Ты получил анализ документа «{fname}» по {n} частям.\n"
+        f"Исходная задача: {task}\n\n"
+        f"Частичные результаты:\n"
+        + "\n\n".join(relevant)
+        + "\n\nОбъедини всё в один структурированный, связный и полный ответ. "
+        f"Устрани дублирование. Документ: {total_chars:,} символов, {n} частей."
+    )
+    try:
+        final_resp = _llm_instance.invoke(reduce_prompt)
+        final_text = final_resp.content if hasattr(final_resp, "content") else str(final_resp)
+        return (
+            f"📄 Полный анализ: {fname}\n"
+            f"Размер: {total_chars:,} символов | Частей: {n} | Перекрытие: {overlap} символов\n"
+            f"{'─' * 50}\n\n"
+            f"{final_text}"
+        )
+    except Exception as e:
+        # Fallback — вернуть все частичные результаты напрямую
+        logger.warning(f"Синтез не удался: {e}. Возвращаем частичные результаты.")
+        return (
+            f"📄 Анализ по частям: {fname} ({total_chars:,} символов, {n} частей)\n"
+            f"{'─' * 50}\n\n"
+            + "\n\n".join(partial_results)
+        )
+
+
+# ============ AGENT ============
+
 ALL_TOOLS = [
     web_search, fetch_url, bash_execute, create_file, view_file, list_files, python_execute,
     # Excel
@@ -1919,6 +2116,8 @@ ALL_TOOLS = [
     docx_read, docx_create, docx_to_pdf,
     # Изображения
     image_info, image_resize, image_convert, image_crop, image_adjust, image_analyze,
+    # Длинные документы (Map-Reduce)
+    document_analyze_full,
 ]
 
 # Добавить браузерные инструменты если Selenium доступен
@@ -1962,6 +2161,10 @@ def create_claude_agent(
         model_kwargs["temperature"] = temperature
 
     model_instance = ChatOpenAI(**model_kwargs)
+
+    # Сохраняем экземпляр LLM для использования в document_analyze_full
+    global _llm_instance
+    _llm_instance = model_instance
 
     checkpointer = MemorySaver() if use_memory else None
 
