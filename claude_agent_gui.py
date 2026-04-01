@@ -1346,11 +1346,18 @@ class ChatApp(_DnDBase):
         self._refresh_files_bar()
 
     def _copy_files(self):
-        copied = []; out = self._get_output_dir(); out.mkdir(parents=True, exist_ok=True)
+        """Копирует прикреплённые файлы в output dir. Возвращает пути назначения."""
+        dest_paths = []
+        out = self._get_output_dir()
+        out.mkdir(parents=True, exist_ok=True)
         for fp in self.attached_files:
-            try: shutil.copy2(fp, out / fp.name); copied.append(fp)
-            except Exception: pass
-        return copied
+            dest = out / fp.name
+            try:
+                shutil.copy2(fp, dest)
+                dest_paths.append(dest)
+            except Exception:
+                pass
+        return dest_paths
 
     # ==================== INPUT ====================
 
@@ -1369,7 +1376,7 @@ class ChatApp(_DnDBase):
         self._add_msg(text, "user", files=files_show or None)
         if copied:
             _ext_tool = {
-                ".pdf": "pdf_read (или document_analyze_full для длинного PDF)",
+                ".pdf": "pdf_read",
                 ".xlsx": "excel_read", ".xls": "excel_read",
                 ".csv": "excel_from_csv",
                 ".docx": "docx_read",
@@ -1379,10 +1386,19 @@ class ChatApp(_DnDBase):
                 ".txt": "view_file", ".md": "view_file",
                 ".py": "view_file", ".json": "view_file",
             }
-            lines = ["[Прикреплённые файлы — ОБЯЗАТЕЛЬНО прочитай их перед ответом:]"]
-            for f in copied:
-                tool = _ext_tool.get(f.suffix.lower(), "view_file")
-                lines.append(f"  • {f.name}  →  используй инструмент: {tool}")
+            # Синхронизируем OUTPUT_DIR агента с реальным путём GUI
+            try:
+                import claude_agent_v3
+                claude_agent_v3.OUTPUT_DIR = self._get_output_dir()
+            except Exception:
+                pass
+            lines = ["[Прикреплённые файлы скопированы. ОБЯЗАТЕЛЬНО прочитай каждый файл через указанный инструмент:]"]
+            for dest in copied:
+                tool = _ext_tool.get(dest.suffix.lower(), "view_file")
+                # Передаём полный абсолютный путь — агент точно найдёт файл
+                lines.append(f'  • {dest.name}')
+                lines.append(f'    Полный путь: {dest}')
+                lines.append(f'    Вызов: {tool}("{dest.name}")')
             text += "\n\n" + "\n".join(lines)
         if not self.agent and not self._init_agent(): return
         self.is_processing = True
@@ -1527,12 +1543,14 @@ class ChatApp(_DnDBase):
         if not key: self._sys_msg(T("no_api_key")); return False
         model_id = self.settings.get("model", "claude-3-5-haiku-20241022")
         url = self.settings.get("base_url", PRESET_URLS[0])
-        cd = self.settings.get("output_dir", "")
-        if cd:
-            try:
-                import claude_agent_v3; p = Path(cd); p.mkdir(parents=True, exist_ok=True)
-                claude_agent_v3.OUTPUT_DIR = p
-            except Exception: pass
+        # Всегда синхронизируем OUTPUT_DIR агента с реальным путём GUI
+        try:
+            import claude_agent_v3
+            out_dir = self._get_output_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            claude_agent_v3.OUTPUT_DIR = out_dir
+        except Exception:
+            pass
         try:
             from claude_agent_v3 import create_claude_agent, make_session_config
             temp = self.settings.get("temperature", 0)
