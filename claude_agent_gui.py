@@ -871,7 +871,8 @@ class ChatApp(_DnDBase):
         lines = min(max(lines, 1), 8)
         fs = self._fs()
         line_h = fs + 8
-        new_h = max(line_h + 14, 8 + lines * line_h)
+        # Минимум 44px совпадает с начальной высотой виджета
+        new_h = max(44, 8 + lines * line_h)
         if not hasattr(self, '_last_input_h'):
             self._last_input_h = 0
         if new_h != self._last_input_h:
@@ -1366,7 +1367,23 @@ class ChatApp(_DnDBase):
         if self.attached_files:
             copied = self._copy_files(); self.attached_files.clear(); self._refresh_files_bar()
         self._add_msg(text, "user", files=files_show or None)
-        if copied: text += f"\n\n[Файлы: {', '.join(f.name for f in copied)}]"
+        if copied:
+            _ext_tool = {
+                ".pdf": "pdf_read (или document_analyze_full для длинного PDF)",
+                ".xlsx": "excel_read", ".xls": "excel_read",
+                ".csv": "excel_from_csv",
+                ".docx": "docx_read",
+                ".png": "image_analyze", ".jpg": "image_analyze",
+                ".jpeg": "image_analyze", ".webp": "image_analyze",
+                ".gif": "image_analyze", ".bmp": "image_analyze",
+                ".txt": "view_file", ".md": "view_file",
+                ".py": "view_file", ".json": "view_file",
+            }
+            lines = ["[Прикреплённые файлы — ОБЯЗАТЕЛЬНО прочитай их перед ответом:]"]
+            for f in copied:
+                tool = _ext_tool.get(f.suffix.lower(), "view_file")
+                lines.append(f"  • {f.name}  →  используй инструмент: {tool}")
+            text += "\n\n" + "\n".join(lines)
         if not self.agent and not self._init_agent(): return
         self.is_processing = True
         self._stop_event = threading.Event()
@@ -1408,20 +1425,31 @@ class ChatApp(_DnDBase):
         self._stream_tb.insert("1.0", T("thinking"))
         self._stream_tb.configure(state="disabled")
         self._stream_text = ""
+        self._stream_flush_pending = False
         self._scroll_down()
 
     def _append_stream(self, chunk):
-        """Добавить текст в стриминг-пузырь. Скрывает <think> блоки."""
+        """Накапливает текст стриминга. UI обновляется батчами через _flush_stream (~60fps)."""
         if not hasattr(self, '_stream_tb') or not self._stream_tb.winfo_exists():
             return
         self._stream_text += chunk
         # Защита от утечки памяти при очень длинных ответах
         if len(self._stream_text) > 200_000:
             self._stream_text = self._stream_text[-150_000:]
+        # Планируем один flush на следующий кадр, если его ещё нет
+        if not getattr(self, '_stream_flush_pending', False):
+            self._stream_flush_pending = True
+            self.after(16, self._flush_stream)
+
+    def _flush_stream(self):
+        """Обновляет стриминг-виджет — вызывается не чаще ~60fps."""
+        self._stream_flush_pending = False
+        if not hasattr(self, '_stream_tb') or not self._stream_tb.winfo_exists():
+            return
 
         # Убрать завершённые <think>...</think>
         display = re.sub(r'<think>.*?</think>', '', self._stream_text, flags=re.DOTALL).strip()
-        # Если ещё внутри <think> — не показывать
+        # Если ещё внутри <think> — не показывать содержимое
         if '<think>' in self._stream_text and '</think>' not in self._stream_text:
             display = T("thinking")
 
