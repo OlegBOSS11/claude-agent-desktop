@@ -871,7 +871,8 @@ class ChatApp(_DnDBase):
         lines = min(max(lines, 1), 8)
         fs = self._fs()
         line_h = fs + 8
-        new_h = max(line_h + 14, 8 + lines * line_h)
+        # Минимум 44px совпадает с начальной высотой виджета
+        new_h = max(44, 8 + lines * line_h)
         if not hasattr(self, '_last_input_h'):
             self._last_input_h = 0
         if new_h != self._last_input_h:
@@ -1345,11 +1346,18 @@ class ChatApp(_DnDBase):
         self._refresh_files_bar()
 
     def _copy_files(self):
-        copied = []; out = self._get_output_dir(); out.mkdir(parents=True, exist_ok=True)
+        """Копирует прикреплённые файлы в output dir. Возвращает пути назначения."""
+        dest_paths = []
+        out = self._get_output_dir()
+        out.mkdir(parents=True, exist_ok=True)
         for fp in self.attached_files:
-            try: shutil.copy2(fp, out / fp.name); copied.append(fp)
-            except Exception: pass
-        return copied
+            dest = out / fp.name
+            try:
+                shutil.copy2(fp, dest)
+                dest_paths.append(dest)
+            except Exception:
+                pass
+        return dest_paths
 
     # ==================== INPUT ====================
 
@@ -1366,7 +1374,32 @@ class ChatApp(_DnDBase):
         if self.attached_files:
             copied = self._copy_files(); self.attached_files.clear(); self._refresh_files_bar()
         self._add_msg(text, "user", files=files_show or None)
-        if copied: text += f"\n\n[Файлы: {', '.join(f.name for f in copied)}]"
+        if copied:
+            _ext_tool = {
+                ".pdf": "pdf_read",
+                ".xlsx": "excel_read", ".xls": "excel_read",
+                ".csv": "excel_from_csv",
+                ".docx": "docx_read",
+                ".png": "image_analyze", ".jpg": "image_analyze",
+                ".jpeg": "image_analyze", ".webp": "image_analyze",
+                ".gif": "image_analyze", ".bmp": "image_analyze",
+                ".txt": "view_file", ".md": "view_file",
+                ".py": "view_file", ".json": "view_file",
+            }
+            # Синхронизируем OUTPUT_DIR агента с реальным путём GUI
+            try:
+                import claude_agent_v3
+                claude_agent_v3.OUTPUT_DIR = self._get_output_dir()
+            except Exception:
+                pass
+            lines = ["[Прикреплённые файлы скопированы. ОБЯЗАТЕЛЬНО прочитай каждый файл через указанный инструмент:]"]
+            for dest in copied:
+                tool = _ext_tool.get(dest.suffix.lower(), "view_file")
+                # Передаём полный абсолютный путь — агент точно найдёт файл
+                lines.append(f'  • {dest.name}')
+                lines.append(f'    Полный путь: {dest}')
+                lines.append(f'    Вызов: {tool}("{dest.name}")')
+            text += "\n\n" + "\n".join(lines)
         if not self.agent and not self._init_agent(): return
         self.is_processing = True
         self._stop_event = threading.Event()
@@ -1408,20 +1441,31 @@ class ChatApp(_DnDBase):
         self._stream_tb.insert("1.0", T("thinking"))
         self._stream_tb.configure(state="disabled")
         self._stream_text = ""
+        self._stream_flush_pending = False
         self._scroll_down()
 
     def _append_stream(self, chunk):
-        """Добавить текст в стриминг-пузырь. Скрывает <think> блоки."""
+        """Накапливает текст стриминга. UI обновляется батчами через _flush_stream (~60fps)."""
         if not hasattr(self, '_stream_tb') or not self._stream_tb.winfo_exists():
             return
         self._stream_text += chunk
         # Защита от утечки памяти при очень длинных ответах
         if len(self._stream_text) > 200_000:
             self._stream_text = self._stream_text[-150_000:]
+        # Планируем один flush на следующий кадр, если его ещё нет
+        if not getattr(self, '_stream_flush_pending', False):
+            self._stream_flush_pending = True
+            self.after(16, self._flush_stream)
+
+    def _flush_stream(self):
+        """Обновляет стриминг-виджет — вызывается не чаще ~60fps."""
+        self._stream_flush_pending = False
+        if not hasattr(self, '_stream_tb') or not self._stream_tb.winfo_exists():
+            return
 
         # Убрать завершённые <think>...</think>
         display = re.sub(r'<think>.*?</think>', '', self._stream_text, flags=re.DOTALL).strip()
-        # Если ещё внутри <think> — не показывать
+        # Если ещё внутри <think> — не показывать содержимое
         if '<think>' in self._stream_text and '</think>' not in self._stream_text:
             display = T("thinking")
 
@@ -1499,12 +1543,14 @@ class ChatApp(_DnDBase):
         if not key: self._sys_msg(T("no_api_key")); return False
         model_id = self.settings.get("model", "claude-3-5-haiku-20241022")
         url = self.settings.get("base_url", PRESET_URLS[0])
-        cd = self.settings.get("output_dir", "")
-        if cd:
-            try:
-                import claude_agent_v3; p = Path(cd); p.mkdir(parents=True, exist_ok=True)
-                claude_agent_v3.OUTPUT_DIR = p
-            except Exception: pass
+        # Всегда синхронизируем OUTPUT_DIR агента с реальным путём GUI
+        try:
+            import claude_agent_v3
+            out_dir = self._get_output_dir()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            claude_agent_v3.OUTPUT_DIR = out_dir
+        except Exception:
+            pass
         try:
             from claude_agent_v3 import create_claude_agent, make_session_config
             temp = self.settings.get("temperature", 0)

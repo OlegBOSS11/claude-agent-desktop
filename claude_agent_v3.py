@@ -246,29 +246,36 @@ WORD (DOCX):
 
 def _resolve_file(filename: str, must_exist: bool = True) -> Optional[Path]:
     """
-    Ищет файл в нескольких директориях:
-    1. OUTPUT_DIR
-    2. WORK_DIR
-    3. Абсолютный путь (если указан)
+    Ищет файл по приоритету:
+    1. Абсолютный путь напрямую (если filename — абсолютный)
+    2. OUTPUT_DIR / basename
+    3. WORK_DIR / basename
+    4. Путь относительно текущей директории (если содержит разделители)
 
     Возвращает Path или None если файл не найден.
     """
-    candidates = [
-        OUTPUT_DIR / Path(filename).name,
-        WORK_DIR / Path(filename).name,
-    ]
+    p = Path(filename)
+    candidates: list = []
 
-    # Если передан абсолютный путь — тоже проверяем
-    abs_path = Path(filename)
-    if abs_path.is_absolute():
-        candidates.insert(0, abs_path)
+    # Приоритет 1: абсолютный путь
+    if p.is_absolute():
+        candidates.append(p)
 
-    for p in candidates:
-        if p.exists():
-            return p
+    # Приоритет 2 и 3: по имени файла в рабочих директориях
+    basename = p.name
+    candidates.append(OUTPUT_DIR / basename)
+    candidates.append(WORK_DIR / basename)
+
+    # Приоритет 4: относительный путь с подпапками
+    if not p.is_absolute() and p.parent != Path("."):
+        candidates.append(p)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
 
     if not must_exist:
-        # Для создания — возвращаем путь в OUTPUT_DIR
+        # Для создания — путь в OUTPUT_DIR
         return OUTPUT_DIR / Path(filename).name
 
     return None
